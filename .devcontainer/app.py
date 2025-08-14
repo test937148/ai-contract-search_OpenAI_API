@@ -1,41 +1,50 @@
+import os
+import json
+import re
+from hashlib import md5
+
+import numpy as np
+import pandas as pd
 import streamlit as st
 import fitz  # PyMuPDF
-import numpy as np
-import re
-import pandas as pd
-import json
-from hashlib import md5
 from sentence_transformers import SentenceTransformer
 from openai import OpenAI
-import os
 
-st.set_page_config(page_title="AI Contract Search (GPT-5)", layout="wide")
-st.title("📄 AI Contract Search (GPT-5)")
+# -------------------------------
+# Streamlit page setup
+# -------------------------------
+st.set_page_config(page_title="AI Contract Search — Per-Document Answers", layout="wide")
+st.title("📄 AI Contract Search — Per-Document, Grounded Answers")
 
-# --------------------
-# 1. Load embedding model
-# --------------------
-@st.cache_resource
-def load_models():
-    return SentenceTransformer('all-MiniLM-L6-v2')
-
-embed_model = load_models()
-
-# --------------------
-# 2. Initialize OpenAI GPT-5 client
-# --------------------
+# -------------------------------
+# Secrets / API key & model
+# -------------------------------
 if "OPENAI_API_KEY" not in st.secrets:
-    st.error("⚠️ OpenAI API key not found! Please add OPENAI_API_KEY in Streamlit Secrets.")
+    st.error("⚠️ OpenAI API key is missing. Add it in Streamlit Secrets as TOML:\n\nOPENAI_API_KEY = \"sk-...\"")
     st.stop()
+
+OPENAI_MODEL = st.secrets.get("OPENAI_MODEL", "gpt-4.1")  # set to "gpt-5" if you have access
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-# --------------------
-# 3. Utility functions
-# --------------------
-def cosine_similarity(a, b):
-    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+# -------------------------------
+# Load embedding model (cached)
+# -------------------------------
+@st.cache_resource
+def load_embedder():
+    return SentenceTransformer("all-MiniLM-L6-v2")
 
-def chunk_text(text, max_words=500, overlap=50):
+embed_model = load_embedder()
+
+# -------------------------------
+# Utilities
+# -------------------------------
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    denom = (np.linalg.norm(a) * np.linalg.norm(b))
+    if denom == 0:
+        return 0.0
+    return float(np.dot(a, b) / denom)
+
+def chunk_text(text: str, max_words: int = 500, overlap: int = 50):
     words = text.split()
     chunks = []
     start = 0
@@ -45,147 +54,264 @@ def chunk_text(text, max_words=500, overlap=50):
         start += max_words - overlap
     return chunks
 
-def extract_paragraph(text, answer):
-    paragraphs = re.split(r'\n\s*\n', text)
-    for para in paragraphs:
-        if answer.lower() in para.lower():
-            return para.strip()
-    return text[:500] + "..."
-
-def hash_file(filename, content_bytes):
+def hash_bytes_for_cache(filename: str, content_bytes: bytes) -> str:
     h = md5()
-    h.update(filename.encode('utf-8'))
+    h.update(filename.encode("utf-8"))
     h.update(content_bytes)
     return h.hexdigest()
 
-# --------------------
-# 4. Upload PDFs and create chunks
-# --------------------
-uploaded_files = st.file_uploader("Upload contract PDFs", type=["pdf"], accept_multiple_files=True)
-chunks_data = []
+def extract_best_paragraph(text: str, answer_hint: str) -> str:
+    # try to surface the most relevant paragraph that contains a key phrase of the answer
+    if not answer_hint:
+        return text[:600] + "..." if len(text) > 600 else text
+    paragraphs = re.split(r"\n\s*\n", text)
+    hint = answer_hint.strip().lower()
+    for p in paragraphs:
+        if hint and hint in p.lower():
+            return p.strip()
+    return text[:600] + "..." if len(text) > 600 else text
 
-cache_file = "embeddings_cache.json"
-if os.path.exists(cache_file):
-    with open(cache_file, "r") as f:
-        cache = json.load(f)
+def safe_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return 0.0
+
+# -------------------------------
+# Embedding Cache (JSON file)
+# -------------------------------
+CACHE_PATH = "embeddings_cache.json"
+if os.path.exists(CACHE_PATH):
+    try:
+        with open(CACHE_PATH, "r") as f:
+            EMB_CACHE = json.load(f)
+    except Exception:
+        EMB_CACHE = {}
 else:
-    cache = {}
+    EMB_CACHE = {}
+
+def save_cache():
+    with open(CACHE_PATH, "w") as f:
+        json.dump(EMB_CACHE, f)
+
+# -------------------------------
+# Upload & preprocess PDFs
+# -------------------------------
+uploaded_files = st.file_uploader("Upload one or more contract PDFs", type=["pdf"], accept_multiple_files=True)
+
+# Each chunk will be: {filename, page, chunk_id, text, embedding}
+all_chunks = []
 
 if uploaded_files:
-    for uploaded_file in uploaded_files:
-        file_bytes = uploaded_file.read()
-        file_hash = hash_file(uploaded_file.name, file_bytes)
+    for f in uploaded_files:
+        # Read once, reuse bytes (prevents EmptyFileError)
+        file_bytes = f.read()
+        file_hash = hash_bytes_for_cache(f.name, file_bytes)
 
-        if file_hash in cache:
-            chunks_data.extend(cache[file_hash])
+        if file_hash in EMB_CACHE:
+            # Use cached chunks
+            all_chunks.extend(EMB_CACHE[file_hash])
             continue
 
+        # Extract & chunk per page (so we keep page provenance)
         with fitz.open(stream=file_bytes, filetype="pdf") as pdf:
             file_chunks = []
             for page_num, page in enumerate(pdf, start=1):
-                page_text = page.get_text()
-                for idx, chunk in enumerate(chunk_text(page_text)):
-                    embedding = embed_model.encode(chunk).tolist()
-                    chunk_obj = {
-                        "filename": uploaded_file.name,
+                page_text = page.get_text() or ""
+                if not page_text.strip():
+                    continue
+                page_chunks = chunk_text(page_text, max_words=500, overlap=50)
+                for idx, chunk in enumerate(page_chunks, start=1):
+                    emb = embed_model.encode(chunk).tolist()
+                    file_chunks.append({
+                        "filename": f.name,
                         "page": page_num,
-                        "chunk_id": idx + 1,
+                        "chunk_id": idx,
                         "text": chunk,
-                        "embedding": embedding
-                    }
-                    file_chunks.append(chunk_obj)
-                    chunks_data.append(chunk_obj)
-        cache[file_hash] = file_chunks
-        with open(cache_file, "w") as f:
-            json.dump(cache, f)
-    st.success(f"✅ Loaded {len(uploaded_files)} documents and {len(chunks_data)} chunks.")
+                        "embedding": emb
+                    })
 
-# --------------------
-# 5. Section classification (optional)
-# --------------------
-def classify_section(chunk_text):
-    prompt = f"Classify this contract text into a standard section (Termination, Payment, Confidentiality, Liability, Misc). Only return the section name.\n\nText:\n{chunk_text[:500]}"
-    try:
-        response = client.chat.completions.create(
-            model="gpt-5",
-            messages=[{"role":"user","content":prompt}]
-        )
-        return response.choices[0].message.content.strip()
-    except:
-        return "Unknown"
+        # Save to in-memory and cache
+        EMB_CACHE[file_hash] = file_chunks
+        save_cache()
+        all_chunks.extend(file_chunks)
 
-for chunk in chunks_data:
-    if "section" not in chunk:
-        chunk["section"] = classify_section(chunk["text"])
+    st.success(f"✅ Loaded {len(uploaded_files)} PDF(s) → {len(all_chunks)} chunks indexed.")
 
-# --------------------
-# 6. Semantic search
-# --------------------
-def search(query, chunks, top_n=5, section_filter=None):
-    query_emb = embed_model.encode(query)
-    sims = []
-    for chunk in chunks:
-        if section_filter and chunk.get("section") != section_filter:
-            continue
-        sim = cosine_similarity(query_emb, np.array(chunk['embedding']))
-        sims.append((chunk, sim))
-    sims.sort(key=lambda x: x[1], reverse=True)
-    return sims[:top_n]
+# -------------------------------
+# Search helpers
+# -------------------------------
+def search_per_document(query: str, chunks: list, top_k_per_doc: int = 3):
+    """
+    Returns a dict: filename -> [(chunk_dict, similarity_score), ...] (top_k_per_doc per file)
+    """
+    if not chunks:
+        return {}
 
-def answer_with_gpt(question, top_chunks, max_chunks_for_gpt=3):
-    selected_chunks = top_chunks[:max_chunks_for_gpt]
-    context = "\n\n".join([c['text'] for c, _ in selected_chunks])
-    prompt = f"You are a legal assistant. Answer the question ONLY using the context below.\n\nQuestion: {question}\n\nContext:\n{context}"
-    response = client.chat.completions.create(
-        model="gpt-5",
-        messages=[{"role":"user","content":prompt}]
+    q_emb = embed_model.encode(query)
+    per_doc_scores = {}
+
+    # Group chunks by filename
+    by_file = {}
+    for c in chunks:
+        by_file.setdefault(c["filename"], []).append(c)
+
+    for filename, c_list in by_file.items():
+        scored = []
+        for c in c_list:
+            sim = cosine_similarity(q_emb, np.array(c["embedding"], dtype=np.float32))
+            scored.append((c, sim))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        per_doc_scores[filename] = scored[:top_k_per_doc]
+
+    return per_doc_scores
+
+def ask_gpt_grounded(question: str, chunks_for_doc: list):
+    """
+    Ask GPT with only this document's top chunks.
+    Forces grounded behavior and returns a structured result.
+    """
+    if not chunks_for_doc:
+        return {
+            "answer": "NOT_FOUND",
+            "explanation": "No relevant passages found.",
+            "support": [],
+            "confidence": "low"
+        }
+
+    # Build compact context with provenance markers
+    context_blocks = []
+    support_meta = []
+    for c, score in chunks_for_doc:
+        context_blocks.append(f"[{c['filename']} | page {c['page']} | chunk {c['chunk_id']} | sim {score:.3f}]\n{c['text']}")
+        support_meta.append({"filename": c["filename"], "page": c["page"], "chunk_id": c["chunk_id"], "similarity": float(score)})
+
+    context = "\n\n".join(context_blocks)
+
+    # Strict grounding instructions + JSON output
+    system_msg = (
+        "You are a contract analysis assistant. Answer ONLY using the provided context. "
+        "If the answer is not explicitly present, reply with JSON where 'answer' is 'NOT_FOUND'. "
+        "Be concise and do not infer beyond the text."
     )
-    return response.choices[0].message.content
+    user_prompt = (
+        "Return a compact JSON object with keys: answer (string), explanation (string), "
+        "confidence (low|medium|high).\n"
+        "Question: " + question + "\n\n"
+        "Context:\n" + context
+    )
 
-# --------------------
-# 7. User input
-# --------------------
-query = st.text_input("Enter your question:")
-section_options = list(set([c.get("section","Unknown") for c in chunks_data]))
-section_filter = st.selectbox("Filter by contract section (optional)", ["All"] + section_options)
-
-# --------------------
-# 8. Search & Display results
-# --------------------
-if query and chunks_data:
-    section_filter_value = None if section_filter=="All" else section_filter
-    top_chunks = search(query, chunks_data, top_n=10, section_filter=section_filter_value)
-
-    st.subheader("🔍 Best Matches")
-    report_rows = []
-
-    gpt_answer = answer_with_gpt(query, top_chunks, max_chunks_for_gpt=3)
-
-    for chunk, score in top_chunks[:5]:
-        paragraph = extract_paragraph(chunk['text'], gpt_answer)
-        st.markdown(
-            f"**📄 {chunk['filename']}** - Page {chunk['page']} - Chunk {chunk['chunk_id']} "
-            f"- Section: {chunk.get('section','Unknown')} (Similarity: {score:.3f})"
+    try:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_prompt}
+            ]
+            # Do NOT set temperature to avoid model-specific constraints
         )
-        st.markdown(f"**Answer:** {gpt_answer}")
-        st.markdown(f"**Context Paragraph:**\n> {paragraph}")
+        content = resp.choices[0].message.content
+    except Exception as e:
+        return {
+            "answer": "ERROR",
+            "explanation": f"OpenAI call failed: {e}",
+            "support": support_meta,
+            "confidence": "low"
+        }
+
+    # Best-effort JSON parse
+    import json as pyjson
+    parsed = None
+    try:
+        parsed = pyjson.loads(content)
+    except Exception:
+        # fallback: wrap as free text
+        parsed = {"answer": content.strip(), "explanation": "", "confidence": "low"}
+
+    # Attach support meta so we can show page provenance
+    parsed["support"] = support_meta
+    return parsed
+
+# -------------------------------
+# UI Controls
+# -------------------------------
+st.markdown("Ask a question and get **separate answers for each document**, grounded in that document’s text.")
+query = st.text_input("🔎 Your question (e.g., 'What is the termination date?')", "")
+col1, col2 = st.columns(2)
+with col1:
+    top_k_per_doc = st.slider("Chunks per document sent to GPT", 1, 8, 3)
+with col2:
+    show_csv = st.checkbox("Enable CSV report download", value=True)
+
+# -------------------------------
+# Run search & show per-document answers
+# -------------------------------
+if query and all_chunks:
+    per_doc_matches = search_per_document(query, all_chunks, top_k_per_doc=top_k_per_doc)
+
+    st.subheader("📚 Answers by Document")
+
+    report_rows = []
+    for filename, top_matches in per_doc_matches.items():
+        result = ask_gpt_grounded(query, top_matches)
+
+        # Prepare display
+        answer = result.get("answer", "").strip()
+        explanation = result.get("explanation", "").strip()
+        confidence = result.get("confidence", "low")
+
+        # Pick one representative paragraph (from the best chunk) to display
+        best_chunk, best_sim = (top_matches[0] if top_matches else (None, 0.0))
+        paragraph = ""
+        if best_chunk:
+            # Try to highlight / surface a relevant paragraph using the answer as a hint
+            paragraph = extract_best_paragraph(best_chunk["text"], answer if answer not in ("NOT_FOUND", "ERROR") else "")
+
+        # Render card for this file
+        st.markdown(f"### 📄 {filename}")
+        if answer == "NOT_FOUND":
+            st.info("Couldn’t find this information in this document.")
+        elif answer == "ERROR":
+            st.error(f"AI error: {explanation}")
+        else:
+            st.markdown(f"**Answer:** {answer}")
+            if explanation:
+                st.caption(f"Reasoning (from context): {explanation}")
+            st.caption(f"Confidence: {confidence}")
+
+        # Show supporting snippet & provenance
+        if paragraph:
+            st.markdown("**Context snippet (from the most similar chunk):**")
+            st.write("> " + paragraph.replace("\n", "\n> "))
+
+        # Show top matches metadata
+        with st.expander("Show supporting chunks & scores"):
+            for c, s in top_matches:
+                st.markdown(f"- Page **{c['page']}**, Chunk **{c['chunk_id']}**, Similarity **{s:.3f}**")
+
         st.markdown("---")
 
+        # Add to report rows
+        # Include first support item’s page for convenience
+        first_supp_page = result.get("support", [{}])[0].get("page") if result.get("support") else None
         report_rows.append({
-            "filename": chunk['filename'],
-            "page": chunk['page'],
-            "chunk_id": chunk['chunk_id'],
-            "section": chunk.get("section", "Unknown"),
-            "similarity": score,
-            "answer": gpt_answer,
-            "context": paragraph
+            "filename": filename,
+            "answer": answer,
+            "confidence": confidence,
+            "best_chunk_page": first_supp_page,
+            "top_chunk_similarity": safe_float(best_sim),
+            "snippet": paragraph
         })
 
-    df_report = pd.DataFrame(report_rows)
-    csv_data = df_report.to_csv(index=False)
-    st.download_button(
-        label="💾 Download Full Search Report as CSV",
-        data=csv_data,
-        file_name="contract_search_report.csv",
-        mime="text/csv"
-    )
+    # CSV download
+    if show_csv and report_rows:
+        df = pd.DataFrame(report_rows)
+        st.download_button(
+            label="💾 Download per-document answers (CSV)",
+            data=df.to_csv(index=False),
+            file_name="contract_answers_per_document.csv",
+            mime="text/csv"
+        )
+
+elif query and not all_chunks:
+    st.warning("Upload at least one PDF to search.")
