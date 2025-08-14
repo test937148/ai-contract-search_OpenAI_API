@@ -85,8 +85,9 @@ if uploaded_files:
                     model="gpt-5",  # Latest GPT-5 model
                     messages=[{"role": "user", "content": prompt}],
                 )
-                answer = completion.choices[0].message["content"]
+                answer = response.choices[0].message.content
                 st.write("**Answer:**", answer)
 
             except Exception as e:
                 st.error(f"OpenAI call failed: {e}")
+
