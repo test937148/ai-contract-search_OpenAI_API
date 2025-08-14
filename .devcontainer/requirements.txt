@@ -1,5 +1,6 @@
 streamlit
 pymupdf
 numpy
+regex
 sentence-transformers
-openai
+openai>=1.0.0
