@@ -3,28 +3,34 @@ import fitz  # PyMuPDF
 import numpy as np
 import re
 import pandas as pd
-import os
 import json
+from hashlib import md5
 from sentence_transformers import SentenceTransformer
 from openai import OpenAI
-from hashlib import md5
+import os
 
 st.set_page_config(page_title="AI Contract Search (GPT-5)", layout="wide")
-st.title("📄 AI-Powered Contract Search (GPT-5)")
+st.title("📄 AI Contract Search (GPT-5)")
 
 # --------------------
-# 1. Load models
+# 1. Load embedding model
 # --------------------
 @st.cache_resource
 def load_models():
-    embed_model = SentenceTransformer('all-MiniLM-L6-v2')
-    return embed_model
+    return SentenceTransformer('all-MiniLM-L6-v2')
 
 embed_model = load_models()
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 # --------------------
-# 2. Utilities
+# 2. Initialize OpenAI GPT-5 client
+# --------------------
+if "OPENAI_API_KEY" not in st.secrets:
+    st.error("⚠️ OpenAI API key not found! Please add OPENAI_API_KEY in Streamlit Secrets.")
+    st.stop()
+client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+
+# --------------------
+# 3. Utility functions
 # --------------------
 def cosine_similarity(a, b):
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
@@ -35,8 +41,7 @@ def chunk_text(text, max_words=500, overlap=50):
     start = 0
     while start < len(words):
         end = start + max_words
-        chunk = " ".join(words[start:end])
-        chunks.append(chunk)
+        chunks.append(" ".join(words[start:end]))
         start += max_words - overlap
     return chunks
 
@@ -47,16 +52,16 @@ def extract_paragraph(text, answer):
             return para.strip()
     return text[:500] + "..."
 
-def hash_file(filename, content):
+def hash_file(filename, content_bytes):
     h = md5()
     h.update(filename.encode('utf-8'))
-    h.update(content.encode('utf-8'))
+    h.update(content_bytes)
     return h.hexdigest()
 
 # --------------------
-# 3. Upload PDFs
+# 4. Upload PDFs and create chunks
 # --------------------
-uploaded_files = st.file_uploader("Upload your contract PDFs", type=["pdf"], accept_multiple_files=True)
+uploaded_files = st.file_uploader("Upload contract PDFs", type=["pdf"], accept_multiple_files=True)
 chunks_data = []
 
 cache_file = "embeddings_cache.json"
@@ -68,56 +73,53 @@ else:
 
 if uploaded_files:
     for uploaded_file in uploaded_files:
-        file_content = uploaded_file.read().decode("latin1")  # fallback for PDF bytes
-        file_hash = hash_file(uploaded_file.name, file_content)
-        
+        file_bytes = uploaded_file.read()
+        file_hash = hash_file(uploaded_file.name, file_bytes)
+
         if file_hash in cache:
-            # Load cached embeddings
             chunks_data.extend(cache[file_hash])
-        else:
-            with fitz.open(stream=uploaded_file.read(), filetype="pdf") as pdf:
-                file_chunks = []
-                for page_num, page in enumerate(pdf, start=1):
-                    page_text = page.get_text()
-                    page_chunks = chunk_text(page_text, max_words=500, overlap=50)
-                    for idx, chunk in enumerate(page_chunks):
-                        embedding = embed_model.encode(chunk).tolist()
-                        chunk_obj = {
-                            "filename": uploaded_file.name,
-                            "page": page_num,
-                            "chunk_id": idx + 1,
-                            "text": chunk,
-                            "embedding": embedding
-                        }
-                        file_chunks.append(chunk_obj)
-                        chunks_data.append(chunk_obj)
-                # Cache
-                cache[file_hash] = file_chunks
-                with open(cache_file, "w") as f:
-                    json.dump(cache, f)
+            continue
+
+        with fitz.open(stream=file_bytes, filetype="pdf") as pdf:
+            file_chunks = []
+            for page_num, page in enumerate(pdf, start=1):
+                page_text = page.get_text()
+                for idx, chunk in enumerate(chunk_text(page_text)):
+                    embedding = embed_model.encode(chunk).tolist()
+                    chunk_obj = {
+                        "filename": uploaded_file.name,
+                        "page": page_num,
+                        "chunk_id": idx + 1,
+                        "text": chunk,
+                        "embedding": embedding
+                    }
+                    file_chunks.append(chunk_obj)
+                    chunks_data.append(chunk_obj)
+        cache[file_hash] = file_chunks
+        with open(cache_file, "w") as f:
+            json.dump(cache, f)
     st.success(f"✅ Loaded {len(uploaded_files)} documents and {len(chunks_data)} chunks.")
 
 # --------------------
-# 4. Section Classification
+# 5. Section classification (optional)
 # --------------------
 def classify_section(chunk_text):
-    prompt = f"Classify this contract text into a standard section (e.g., Termination, Payment, Confidentiality, Liability, Misc). Only return the section name.\n\nText:\n{chunk_text[:500]}"
-    response = client.chat.completions.create(
-        model="gpt-5",
-        messages=[{"role":"user","content":prompt}]
-    )
-    section = response.choices[0].message.content.strip()
-    return section
+    prompt = f"Classify this contract text into a standard section (Termination, Payment, Confidentiality, Liability, Misc). Only return the section name.\n\nText:\n{chunk_text[:500]}"
+    try:
+        response = client.chat.completions.create(
+            model="gpt-5",
+            messages=[{"role":"user","content":prompt}]
+        )
+        return response.choices[0].message.content.strip()
+    except:
+        return "Unknown"
 
 for chunk in chunks_data:
     if "section" not in chunk:
-        try:
-            chunk["section"] = classify_section(chunk["text"])
-        except:
-            chunk["section"] = "Unknown"
+        chunk["section"] = classify_section(chunk["text"])
 
 # --------------------
-# 5. Semantic Search
+# 6. Semantic search
 # --------------------
 def search(query, chunks, top_n=5, section_filter=None):
     query_emb = embed_model.encode(query)
@@ -141,14 +143,14 @@ def answer_with_gpt(question, top_chunks, max_chunks_for_gpt=3):
     return response.choices[0].message.content
 
 # --------------------
-# 6. User Input
+# 7. User input
 # --------------------
 query = st.text_input("Enter your question:")
-section_options = list(set([c.get("section", "Unknown") for c in chunks_data]))
+section_options = list(set([c.get("section","Unknown") for c in chunks_data]))
 section_filter = st.selectbox("Filter by contract section (optional)", ["All"] + section_options)
 
 # --------------------
-# 7. Run Search & Display Results
+# 8. Search & Display results
 # --------------------
 if query and chunks_data:
     section_filter_value = None if section_filter=="All" else section_filter
@@ -159,7 +161,7 @@ if query and chunks_data:
 
     gpt_answer = answer_with_gpt(query, top_chunks, max_chunks_for_gpt=3)
 
-    for chunk, score in top_chunks[:5]:  # top 5 chunks UI display
+    for chunk, score in top_chunks[:5]:
         paragraph = extract_paragraph(chunk['text'], gpt_answer)
         st.markdown(
             f"**📄 {chunk['filename']}** - Page {chunk['page']} - Chunk {chunk['chunk_id']} "
